@@ -1,0 +1,3 @@
+[submodule "vendor/dep"]
+	path = vendor/dep
+	url = http://2130706433:9001/
