@@ -1,0 +1,3 @@
+[submodule "vendor/dep"]
+	path = vendor/dep
+	url = file:///etc/passwd
