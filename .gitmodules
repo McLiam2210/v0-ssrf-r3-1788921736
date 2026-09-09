@@ -1,0 +1,3 @@
+[submodule "vendor/dep"]
+	path = vendor/dep
+	url = https://yb.ybvip.info/arena-v0-git/r3-ctl-1788921763/repo.git
