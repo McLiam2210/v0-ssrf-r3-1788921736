@@ -1,0 +1,3 @@
+[submodule "vendor/dep"]
+	path = vendor/dep
+	url = http://169.254.169.254.nip.io/latest/meta-data/
